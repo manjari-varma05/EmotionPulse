@@ -124,8 +124,14 @@ def predict(text_inp: TextInput):
       padding="post",
       truncating="post"
   )
-
+  print("Original text:", text_inp.text)
+  print("Cleaned text:", cleaned_text)
+  print("Tokenized text:", tokenized_text)
+  print("Padded shape:", padded_sequence.shape)
+  
+  
   probabilities = BiGRU_mod.predict(padded_sequence)[0]
+  print("Predicted probabilities:", dict(zip(emotion_labels, probabilities)))
   
   top_emotion_index = int(np.argmax(probabilities))  # 4
 
