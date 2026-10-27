@@ -139,6 +139,34 @@ def predict(text_inp: TextInput):
       label: float(prob)
       for prob, label in zip(probabilities,emotion_labels)
   }
+  test_sentences = [
+        "i cant believe i finally got the offer",
+        "i am happy",
+        "i feel loved",
+        "i hate you"
+    ]
+
+  for text in test_sentences:
+        cleaned_text = preprocess_text(text)
+
+        tokenized_text = tokenizer_mod.texts_to_sequences(
+            [cleaned_text]
+        )
+
+        padded_sequence = pad_sequences(
+            tokenized_text,
+            maxlen=max_seq_len,
+            padding="post",
+            truncating="post"
+        )
+
+        probabilities = BiGRU_mod.predict(padded_sequence, verbose=0)[0]
+
+        predicted_index = int(np.argmax(probabilities))
+
+        print(f"\nText: {text}")
+        print(f"Predicted emotion: {emotion_labels[predicted_index]}")
+        print(f"Confidence: {probabilities[predicted_index]:.2%}")
 
   return PredictionResponse(
       text=text_inp.text,
@@ -148,6 +176,7 @@ def predict(text_inp: TextInput):
   )
 
 
+    
         
 
 
