@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
         dl_mod["GeminiClient"] = genai.Client(
             api_key=gemini_key,
             http_options={
-                "timeout": 2500,
+                "timeout": 10000,
                 "retry_options": {"attempts": 1},
             },
         ).aio
@@ -69,7 +69,7 @@ async def lifespan(app: FastAPI):
     if openai_key:
         dl_mod["OpenAIClient"] = AsyncOpenAI(
             api_key=openai_key,
-            timeout=4.0,
+            timeout=20.0,
             max_retries=0,
         )
 
@@ -254,7 +254,7 @@ Supportive response: ...
         try:
             result = await asyncio.wait_for(
                 gemini.models.generate_content(
-                    model="gemini-3.8-flash",
+                    model="gemini-3.5-flash-lite",
                     contents=prompt,
                 ),
                 timeout=2.7,
@@ -281,24 +281,19 @@ Supportive response: ...
 
     if openai_client:
         try:
-            result = await asyncio.wait_for(
-                openai_client.responses.create(
-                    model=os.getenv(
-                        "OPENAI_MODEL", "gpt-4.1-mini"
-                    ),
-                    input=prompt,
-                ),
-                timeout=4.5,
-            )
+            result = await openai_client.responses.create(
+    model="gpt-4.1-mini",
+    input=prompt
+)
 
-            if result.output_text and result.output_text.strip():
+            if result.output_text:
                 return {
                     "text": text_inp.text,
                     "bigru_emotion": prediction.predicted_emot,
                     "bigru_confidence": prediction.confidence,
                     "all_probab": prediction.all_probab,
-                    "llm_analysis": result.output_text.strip(),
-                    "llm_provider": "openai",
+                    "llm_analysis": result.output_text,
+                    "llm_provider": "openai"
                 }
 
             errors.append("OpenAI returned an empty response.")
