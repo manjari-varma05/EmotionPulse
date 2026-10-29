@@ -14,7 +14,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-
+import asyncio
+from openai import AsyncOpenAI
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 
@@ -42,20 +43,51 @@ emotion_emojis = {
 # Load model and tokenizer once when FastAPI starts
 dl_mod = {}
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Loading the BiGRU model and tokenizer...")
 
-    dl_mod["BiGRU"] = load_model(mod_path)
+    dl_mod["BiGRU"] = load_model(mod_path, compile=False)
 
     with open(tokenizer_path, "rb") as file:
         dl_mod["Tokenizer"] = pickle.load(file)
 
-    print("Model and tokenizer loaded successfully.")
+    # Initialize the LLM clients once at startup.
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
 
-    yield
+    if gemini_key:
+        dl_mod["GeminiClient"] = genai.Client(
+            api_key=gemini_key,
+            http_options={
+                "timeout": 2500,
+                "retry_options": {"attempts": 1},
+            },
+        ).aio
 
-    dl_mod.clear()
+    if openai_key:
+        dl_mod["OpenAIClient"] = AsyncOpenAI(
+            api_key=openai_key,
+            timeout=4.0,
+            max_retries=0,
+        )
+
+    print("Model, tokenizer, and available LLM clients initialized.")
+
+    try:
+        yield
+    finally:
+        gemini = dl_mod.get("GeminiClient")
+        if gemini:
+            await gemini.aclose()
+
+        openai_client = dl_mod.get("OpenAIClient")
+        if openai_client:
+            await openai_client.close()
+
+        dl_mod.clear()
+
 
 
 app = FastAPI(lifespan=lifespan)
@@ -183,115 +215,109 @@ def predict(text_inp: TextInput):
     return get_prediction(text_inp.text)
 
 
+
 @app.post("/analyze-emotion")
-def analyze_emotion(text_inp: TextInput):
-    # Stage 1: Get the prediction for THIS user's sentence
+async def analyze_emotion(text_inp: TextInput):
+    # Stage 1: Predict emotion using your existing BiGRU.
     prediction = get_prediction(text_inp.text)
 
-    # Stage 2: Check Gemini API key
-    api_key = os.getenv("GEMINI_API_KEY")
-
-    if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="GEMINI_API_KEY is missing."
-        )
-
-    # Stage 3: Prepare the LLM prompt
+    # Stage 2: Prepare a personalized prompt.
     prompt = f"""
 You are EmotionPulse, an empathetic emotion-analysis assistant.
 
-User's sentence: {text_inp.text}
+User's original message:
+{text_inp.text}
 
 BiGRU predicted emotion: {prediction.predicted_emot}
 BiGRU confidence: {prediction.confidence:.2%}
 
 Instructions:
-1. Interpret the sentence using its full context.
-2. Consider whether the predicted emotion fits the wording.
-3. If it does not fit, explain the likely emotion suggested
-   by the sentence instead of blindly trusting the prediction.
-4. Give a short, warm, natural, relatable response.
-5. Do not invent personal details or claim certainty about feelings.
-
-Return these three sections:
+- Consider the user's actual words and their context.
+- Treat the predicted emotion as a clue, not a certainty.
+- Generate a personalized, warm, natural response.
+- Acknowledge the specific situation described by the user.
+- Do not use generic, repetitive responses.
+- Do not invent personal details or diagnose the user.
+- Keep the response concise and conversational.
+- Return:
 Likely emotion: ...
 Explanation: ...
 Supportive response: ...
 """
 
-    # Stage 4: Call Gemini with limited retries
-    try:
-        client = genai.Client(api_key=api_key)
-        response = None
+    errors = []
 
-        for attempt in range(3):
-            try:
-                response = client.models.generate_content(
+    # Stage 3: Try Gemini first, with a strict deadline.
+    gemini = dl_mod.get("GeminiClient")
+
+    if gemini:
+        try:
+            result = await asyncio.wait_for(
+                gemini.models.generate_content(
                     model="gemini-3.8-flash",
-                    contents=prompt
-                )
+                    contents=prompt,
+                ),
+                timeout=2.7,
+            )
 
-                if response.text:
-                    break
+            if result.text and result.text.strip():
+                return {
+                    "text": text_inp.text,
+                    "bigru_emotion": prediction.predicted_emot,
+                    "bigru_confidence": prediction.confidence,
+                    "all_probab": prediction.all_probab,
+                    "llm_analysis": result.text.strip(),
+                    "llm_provider": "gemini",
+                }
 
-                print("Gemini returned an empty response.")
+            errors.append("Gemini returned an empty response.")
 
-            except Exception as e:
-                error_text = str(e).upper()
+        except Exception as e:
+            errors.append(f"Gemini failed: {type(e).__name__}")
+            print("Gemini request failed:", repr(e))
 
-                is_temporary = (
-                    "503" in error_text
-                    or "UNAVAILABLE" in error_text
-                    or "429" in error_text
-                    or "RESOURCE_EXHAUSTED" in error_text
-                )
+    # Stage 4: If Gemini fails or times out, use OpenAI.
+    openai_client = dl_mod.get("OpenAIClient")
 
-                if not is_temporary:
-                    raise
+    if openai_client:
+        try:
+            result = await asyncio.wait_for(
+                openai_client.responses.create(
+                    model=os.getenv(
+                        "OPENAI_MODEL", "gpt-4.1-mini"
+                    ),
+                    input=prompt,
+                ),
+                timeout=4.5,
+            )
 
-                print(
-                    f"Gemini temporarily unavailable. "
-                    f"Attempt {attempt + 1}/3: {e}"
-                )
+            if result.output_text and result.output_text.strip():
+                return {
+                    "text": text_inp.text,
+                    "bigru_emotion": prediction.predicted_emot,
+                    "bigru_confidence": prediction.confidence,
+                    "all_probab": prediction.all_probab,
+                    "llm_analysis": result.output_text.strip(),
+                    "llm_provider": "openai",
+                }
 
-                if attempt < 2:
-                    time.sleep(2 * (attempt + 1))
+            errors.append("OpenAI returned an empty response.")
 
-        # Stage 5: Keep the app usable if Gemini fails
-        if response is None or not response.text:
-            return {
-                "text": text_inp.text,
-                "bigru_emotion": prediction.predicted_emot,
-                "bigru_confidence": prediction.confidence,
-                "all_probab": prediction.all_probab,
-                "llm_analysis": (
-                    "Gemini is temporarily unavailable. "
-                    "Your BiGRU prediction is ready, but the "
-                    "supportive response could not be generated. "
-                    "Please try again later."
-                )
-            }
+        except Exception as e:
+            errors.append(f"OpenAI failed: {type(e).__name__}")
+            print("OpenAI request failed:", repr(e))
 
-        # Stage 6: Return BiGRU results and Gemini response
-        return {
-            "text": text_inp.text,
+    # Stage 5: Both LLM providers failed.
+    # Do not pretend a personalized LLM response was generated.
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "message": (
+                "Personalized response generation is "
+                "temporarily unavailable. Please try again."
+            ),
             "bigru_emotion": prediction.predicted_emot,
             "bigru_confidence": prediction.confidence,
-            "all_probab": prediction.all_probab,
-            "llm_analysis": response.text
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        print("GEMINI ERROR:", repr(e))
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Gemini request failed. Check the backend "
-                "terminal for the exact error."
-            )
-        )
+            "errors": errors,
+        },
+    )

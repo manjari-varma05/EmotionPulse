@@ -5,3 +5,4 @@ numpy<2
 tensorflow-cpu==2.16.1
 python-dotenv==1.0.1
 google-genai
+openai
